@@ -35,10 +35,18 @@ do not assume that Pi-specific implementation changes can be merged unchanged.
 ## Distribution and identity
 
 - npm package and CLI command: `ompweb`.
+- The workflow repository owns the `ompw` command; it invokes `ompweb --omp-config ...` for Web mode.
 - Default server address: `http://127.0.0.1:30177`.
+- An occupied port is reused only when its `/healthz` endpoint identifies ompweb;
+  another service remains an error.
+- A workflow config is selected once when the singleton Web service starts and
+  is inherited by every live RPC child. Session cwd remains per child, not a
+  property of the Web server.
 - Existing `OMP_WEB_*` environment variables remain the configuration prefix
   for compatibility: `OMP_WEB_HOSTNAME`, `OMP_WEB_NO_OPEN`,
-  `OMP_WEB_PASSWORD`, and `OMP_WEB_OMP_BIN`.
+  `OMP_WEB_PASSWORD`, `OMP_WEB_OMP_BIN`, and `OMP_WEB_OMP_CONFIG`.
+- `--omp-config` and `OMP_WEB_OMP_CONFIG` can select an explicit OMP config for
+  live RPC children; ordinary `ompweb` without either remains unconfigured.
 - `PI_CODING_AGENT_DIR`, profiles, and OMP's own directory conventions are
   respected because they identify the user’s existing OMP state.
 - The web UI displays its own package version separately from the detected
@@ -96,17 +104,13 @@ atomic where possible; archive or deletion stops the associated live process
 first. ompweb does not provide a general editor for session JSONL or opaque OMP
 state.
 
-Models and allow-listed OMP settings use surgical YAML updates that preserve
-unrelated content. Plugin operations run the installed `omp plugin` CLI. MCP
-configuration is project-local, validated before writing, and saved atomically.
-
 ## Security contract
 
 - Bind loopback-only by default. A non-loopback hostname is an explicit opt-in.
-- `OMP_WEB_PASSWORD` protects every route with a password-only sign-in screen.
-  Successful sign-in creates an HTTP-only, signed cookie with a 30-day expiry;
-  changing the configured password invalidates existing sessions. Exposed
-  deployments require HTTPS through a trusted reverse proxy or VPN.
+- `OMP_WEB_PASSWORD` protects the UI and API routes with a password-only
+  sign-in screen. The unauthenticated `/healthz` route exposes only a fixed
+  liveness marker so local launchers can detect an existing ompweb instance.
+  It must never include workspace, session, or secret data.
 - API requests are origin-checked. Do not add browser-to-host execution paths
   that bypass this boundary.
 - OMP RPC host tools are intentionally not registered. A browser request must

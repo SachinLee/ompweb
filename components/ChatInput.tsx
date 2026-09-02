@@ -143,6 +143,34 @@ function formatTokenCount(tokens: number, locale: string): string {
 }
 
 type SlashCommandSource = "builtin" | "extension" | "prompt" | "skill" | "ompBuiltin";
+export type SlashCompletion = {
+  start: number;
+  end: number;
+  query: string;
+};
+
+/** Finds the slash token under the caret without treating URLs and file paths as commands. */
+export function findSlashCompletion(value: string, cursor: number): SlashCompletion | null {
+  const boundedCursor = Math.max(0, Math.min(cursor, value.length));
+  const prefix = value.slice(0, boundedCursor);
+  const match = /(?:^|\s)\/([^\s/]*)$/.exec(prefix);
+  if (!match) return null;
+
+  const rawQuery = match[1];
+  const query = rawQuery.toLowerCase();
+  const start = boundedCursor - rawQuery.length - 1;
+  let end = boundedCursor;
+  while (end < value.length && !/\s/.test(value[end]!)) end += 1;
+  return { start, end, query };
+}
+
+/** Replaces only the active slash token, preserving the surrounding prompt. */
+export function replaceSlashCompletion(value: string, completion: SlashCompletion, commandName: string): string {
+  const suffix = value.slice(completion.end);
+  const separator = suffix && /^\s/.test(suffix) ? "" : " ";
+  return `${value.slice(0, completion.start)}/${commandName}${separator}${suffix}`;
+}
+
 
 type SlashCommandPaletteItem = {
   name: string;
@@ -407,6 +435,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     [locale],
   );
   const [value, setValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
+  const [selectionStart, setSelectionStart] = useState(() => (draftKey ? (getDraft(draftKey)?.value.length ?? 0) : 0));
+
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [modelDropdownRect, setModelDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
@@ -466,6 +496,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       const current = ta ? ta.value : value;
       if (current.trim()) return;
       setValue(text);
+      setSelectionStart(text.length);
+
       setAtQuery(null);
       requestAnimationFrame(() => {
         if (!ta) return;
@@ -482,6 +514,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       // the user already typed, separated by a blank line.
       const combined = [text, current].filter((t) => t.trim()).join("\n\n");
       setValue(combined);
+      setSelectionStart(combined.length);
+
       setAtQuery(null);
       requestAnimationFrame(() => {
         if (!ta) return;
@@ -494,8 +528,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     insertText(text: string) {
       const ta = textareaRef.current;
       if (!ta) {
-        setValue((v) => v + (v ? " " : "") + text);
+        const nextValue = valueRef.current + (valueRef.current ? " " : "") + text;
+        setValue(nextValue);
+        setSelectionStart(nextValue.length);
         return;
+
       }
       const start = ta.selectionStart ?? ta.value.length;
       const end = ta.selectionEnd ?? ta.value.length;
@@ -504,6 +541,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       const sep = before.length > 0 && !before.endsWith(" ") ? " " : "";
       const newVal = before + sep + text + after;
       setValue(newVal);
+      setSelectionStart(start + sep.length + text.length);
+
       setAtQuery(null);
       requestAnimationFrame(() => {
         if (!ta) return;
@@ -674,6 +713,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const clearInput = useCallback(() => {
     setValue("");
+    setSelectionStart(0);
+
     setAtQuery(null);
     setHistoryMenuOpen(false);
     if (draftKey) clearDraft(draftKey);
@@ -711,6 +752,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const draft = draftKey ? getDraft(draftKey) : null;
     draftKeyRef.current = draftKey;
     setValue(draft?.value ?? "");
+    setSelectionStart(draft?.value.length ?? 0);
+
     setAtQuery(null);
     setHistoryMenuOpen(false);
     setAttachedImages((prev) => {
@@ -766,9 +809,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     clearInput();
   }, [value, attachedImages, attachedTextFiles, isStreaming, onBuiltinCommand, onSend, clearInput, onAudioUnlock, rejectsOversizedPrompt]);
 
-  const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
-    ? value.slice(1).toLowerCase()
-    : null;
+  const slashCompletion = findSlashCompletion(value, selectionStart);
+  const slashQuery = slashCompletion?.query ?? null;
+
   const [dormantSkillNames, setDormantSkillNames] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
@@ -958,6 +1001,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const newValue = before + insert.text + after;
     const newPos = before.length + insert.cursorOffset;
     setValue(newValue);
+    setSelectionStart(newPos);
+
     // setValue alone does not fire onChange — re-derive the token here. Files
     // end with a space (token closes, menu hides); directories end with "/"
     // before the caret (token stays open for drill-down into the directory).
@@ -1004,6 +1049,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const applyHistoryInput = useCallback((text: string) => {
     setValue(text);
+    setSelectionStart(text.length);
+
     setHistoryMenuOpen(false);
     setHistoryActiveIndex(0);
     setAtQuery(null);
@@ -1018,19 +1065,23 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   }, []);
 
   const applySlashCommand = useCallback((command: SlashCommandPaletteItem) => {
-    const nextValue = `/${command.name} `;
+    if (!slashCompletion) return;
+    const nextValue = replaceSlashCompletion(value, slashCompletion, command.name);
+    const nextCursor = nextValue.length - value.slice(slashCompletion.end).length;
     setValue(nextValue);
+    setSelectionStart(nextCursor);
     setSlashMenuOpen(false);
     setSlashActiveIndex(0);
     requestAnimationFrame(() => {
       const ta = textareaRef.current;
       if (!ta) return;
       ta.focus();
-      ta.setSelectionRange(nextValue.length, nextValue.length);
+      ta.setSelectionRange(nextCursor, nextCursor);
       ta.style.height = "auto";
       ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [slashCompletion, value]);
+
 
   const sendQueued = useCallback((mode: "steer" | "followup") => {
     const msg = value.trim();
@@ -2184,12 +2235,16 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             value={value}
             onChange={(e) => {
               setValue(e.target.value);
+              setSelectionStart(e.target.selectionStart);
+
               setHistoryMenuOpen(false);
               updateAtQuery(e.target.value, e.target.selectionStart);
             }}
             onSelect={(e) => {
               const el = e.currentTarget;
               updateAtQuery(el.value, el.selectionStart);
+              setSelectionStart(el.selectionStart);
+
             }}
             onKeyDown={handleKeyDown}
             onCompositionStart={() => {
@@ -2200,6 +2255,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               lastCompositionEndAtRef.current = Date.now();
               const el = e.currentTarget;
               updateAtQuery(el.value, el.selectionStart);
+              setSelectionStart(el.selectionStart);
             }}
             onInput={handleInput}
             onPaste={handlePaste}

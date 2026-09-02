@@ -6,6 +6,7 @@ export function proxy(request: NextRequest) {
   if (request.nextUrl.pathname.startsWith("/api/") && shouldCheckApiRequestOrigin(request) && !isApiRequestOriginAllowed(request)) {
     return NextResponse.json({ error: "Cross-origin API requests are not allowed" }, { status: 403 });
   }
+  if (request.nextUrl.pathname === "/healthz") return NextResponse.next();
   if (!isWebPasswordEnabled()) {
     return request.nextUrl.pathname === "/login"
       ? NextResponse.redirect(new URL("/", request.url))

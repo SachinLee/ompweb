@@ -44,15 +44,40 @@ npm install -g @kahme247/ompweb
 ompweb
 ```
 
-ブラウザで [http://127.0.0.1:30177](http://127.0.0.1:30177) を開きます。
+**エンジニアリングワークフローで共有 Web UI を使う場合:**
+
+```powershell
+ompw --web
+```
+
+`ompw` は `my-engineering-workflow` が提供します。`ompweb` は同名コマンドを再登録しません。
+`ompw --web` は 1 つの Web サービスだけを起動または再利用します。複数のプロジェクトを
+同じ UI で管理し、各ライブ OMP 子プロセスはそれぞれの session cwd を使用します。
+
+設定ファイルを直接指定する場合:
+
+```powershell
+ompweb --omp-config "D:\my-works\claude-skills\my-engineering-workflow\config\omp-workflow.yml"
+```
+
+続いて [http://127.0.0.1:30177](http://127.0.0.1:30177) を開きます。サーバーの準備が整うと、CLI はブラウザを自動的に開こうとします。ompweb はデフォルトで `127.0.0.1` で待ち受けます。
 
 ### CLI オプション
 
 ```bash
-ompweb --port 8080                         # ポート番号指定
-ompweb --hostname 0.0.0.0                  # ネットワーク公開
-ompweb --password "your-password"          # パスワード認証を有効化
-ompweb --no-open                           # ブラウザ自動起動を無効化
+ompweb --port 8080              # カスタムポート
+ompweb --hostname 0.0.0.0       # 信頼できるネットワークに公開
+ompweb -p 8080 -H 0.0.0.0       # オプションを組み合わせる
+ompweb --no-open                # ブラウザを自動的に開かない
+ompweb --omp-config "D:\path\to\engineering-workflow.yml" # ライブ OMP 子プロセスの設定
+
+ompweb --password "a-long-random-password" # パスワードのみのサインインを有効化（Windows でも同様）
+
+PORT=8080 ompweb                # 環境変数にも対応
+OMP_WEB_HOSTNAME=0.0.0.0 ompweb # ネットワーク公開を明示的に有効化
+OMP_WEB_PASSWORD='a-long-random-password' ompweb # 環境変数でも同様（POSIX）
+# Windows: $env:OMP_WEB_PASSWORD="secret"; ompweb
+OMP_WEB_NO_OPEN=1 ompweb        # バックグラウンドサービスとして実行する場合に便利
 ```
 
 ## 主な機能
@@ -68,14 +93,29 @@ ompweb --no-open                           # ブラウザ自動起動を無効�
 
 ## 環境変数
 
-| 変数名 | 説明 | デフォルト値 |
-| --- | --- | --- |
-| `PORT` | サーバーポート | `30177` |
-| `OMP_WEB_HOSTNAME` | バインドホスト | `127.0.0.1` |
-| `OMP_WEB_PASSWORD` | Web ログイン用パスワード | _なし（認証無効）_ |
-| `OMP_WEB_NO_OPEN` | `1` でブラウザ自動起動を無効化 | `0` |
-| `OMP_WEB_OMP_BIN` | `omp` の絶対パス（PATH 未登録時） | _自動検出_ |
-| `PI_CODING_AGENT_DIR` | カスタム omp エージェントディレクトリ | `~/.omp/agent` |
+## 設定
+
+| 変数 | 意味 |
+| --- | --- |
+| `PORT` | サーバーポート（デフォルト `30177`。`-p/--port` が優先） |
+| `OMP_WEB_HOSTNAME` | バインドするホスト名（デフォルト `127.0.0.1`。`-H/--hostname` が優先） |
+| `OMP_WEB_PASSWORD` | サインイン画面用の任意のパスワード |
+| `OMP_WEB_NO_OPEN` | `1`/`true` を設定するとブラウザの自動起動をスキップ |
+| `OMP_WEB_OMP_BIN` | `PATH` にない場合の `omp` バイナリ絶対パス |
+| `OMP_WEB_OMP_CONFIG` / `--omp-config` | すべてのライブ OMP 子プロセスへ渡す設定ファイル |
+| `PI_CODING_AGENT_DIR` | 別の omp agent ディレクトリ（デフォルト `~/.omp/agent`） |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | サーバーサイドリクエスト用の標準プロキシ変数 |
+
+## アーキテクチャ
+
+ompweb は Node 上でホストされる Next.js アプリで、インストール済みの `omp` バイナリを操作します。エージェント自体は同梱していません:
+
+- **ライブセッション**: `omp --mode rpc-ui`（stdio 上の NDJSON）を、アクティブなセッションごとに 1 つの子プロセスとして起動します。そのため、エージェントのバージョンは常にインストールされているものと完全に一致します。
+- **セッション閲覧**: omp のセッションファイル（`~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl`）を直接読み込みます。タイトル変更、アーカイブ、削除は、OMP のライブ書き込みと競合しないよう保護されたネイティブファイルのメンテナンス操作です。
+- **モデルと認証**: omp 子プロセスに対する RPC コマンドを使用します。モデルパネルは omp エージェントディレクトリ内の `models.yml` を編集します。
+- **スキルとプラグイン**: omp のスキルディレクトリ（`~/.omp/agent/skills`、プロジェクトの `.omp/skills`、互換ディレクトリ）をスキャンし、プラグイン管理には `omp plugin` を呼び出します。
+- **ファイルアクセス**: ファイルの閲覧とプレビューは、選択したプロジェクトディレクトリとセッションに現れる作業ディレクトリに限定されます。
+- **フォークとセッション内ブランチの違い**: フォークは新しい `.jsonl` ファイルを作成します。「ここから編集」は同じセッションファイル内に別のブランチを作成します。
 
 ## 開発
 

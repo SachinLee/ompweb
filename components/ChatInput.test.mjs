@@ -8,7 +8,7 @@ const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
   tsconfigPaths: true,
 });
-const { ChatInput, ModelErrorBanner, filterModelOptions } = await jiti.import("./ChatInput.tsx");
+const { ChatInput, ModelErrorBanner, filterModelOptions, findSlashCompletion, replaceSlashCompletion } = await jiti.import("./ChatInput.tsx");
 const { setDraft, clearDraft } = await jiti.import("@/lib/draft-store");
 
 test("shows Queue instead of Stop for typed text during a run", () => {
@@ -129,6 +129,25 @@ test("filters model options by display name, identifier, and provider", () => {
   assert.deepEqual(filterModelOptions(options, "5.2", "en"), [options[0]]);
   assert.deepEqual(filterModelOptions(options, "OPENAI", "en"), [options[0]]);
   assert.equal(filterModelOptions(options, "   ", "en"), options);
+});
+test("finds and replaces a slash token inside an existing prompt", () => {
+  const value = "请先分析 /ski 然后继续修复";
+  const completion = findSlashCompletion(value, value.indexOf(" 然后"));
+
+  assert.deepEqual(completion, {
+    start: value.indexOf("/ski"),
+    end: value.indexOf(" 然后"),
+    query: "ski",
+  });
+  assert.equal(replaceSlashCompletion(value, completion, "skill"), "请先分析 /skill 然后继续修复");
+});
+
+test("does not complete slashes in URLs or file paths", () => {
+  const url = "参考 https://example.com/docs";
+  const file = "读取 src/components/ChatInput.tsx";
+
+  assert.equal(findSlashCompletion(url, url.length), null);
+  assert.equal(findSlashCompletion(file, file.length), null);
 });
 test("queued slash commands gate /advisor behind the per-chat toggle", async () => {
   const { readFile } = await import("node:fs/promises");

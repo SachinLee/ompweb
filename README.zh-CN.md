@@ -44,15 +44,41 @@ npm install -g @kahme247/ompweb
 ompweb
 ```
 
-在浏览器中打开 [http://127.0.0.1:30177](http://127.0.0.1:30177)。
+**使用工程工作流启动共享 Web UI：**
+
+```powershell
+ompw --web
+```
+
+`ompw` 由 `my-engineering-workflow` 提供，`ompweb` 不会重新注册同名命令。
+`ompw --web` 只启动或复用一个 Web 服务；从多个项目目录执行时，项目会在同一个 Web UI
+中管理，每个实时 OMP 子进程仍使用自己的 session cwd。
+
+如果需要直接使用配置文件，也可以运行：
+
+```powershell
+ompweb --omp-config "D:\my-works\claude-skills\my-engineering-workflow\config\omp-workflow.yml"
+```
+
+
+然后打开 [http://127.0.0.1:30177](http://127.0.0.1:30177)。服务器就绪后，CLI 会尝试自动打开浏览器。ompweb 默认监听 `127.0.0.1`。
 
 ### CLI 选项
 
 ```bash
-ompweb --port 8080                         # 自定义端口
-ompweb --hostname 0.0.0.0                  # 监听网络地址
-ompweb --password "your-password"          # 启用密码保护
-ompweb --no-open                           # 不自动打开浏览器
+ompweb --port 8080              # 自定义端口
+ompweb --hostname 0.0.0.0       # 在可信网络中暴露服务
+ompweb -p 8080 -H 0.0.0.0       # 组合使用
+ompweb --no-open                # 不自动打开浏览器
+ompweb --omp-config "D:\path\to\engineering-workflow.yml" # 为实时 OMP 子进程指定配置
+
+ompweb --password "a-long-random-password" # 启用仅密码登录（Windows 同样适用）
+
+PORT=8080 ompweb                # 也支持环境变量
+OMP_WEB_HOSTNAME=0.0.0.0 ompweb # 显式暴露到网络
+OMP_WEB_PASSWORD='a-long-random-password' ompweb # 环境变量形式（POSIX）
+# Windows: $env:OMP_WEB_PASSWORD="secret"; ompweb
+OMP_WEB_NO_OPEN=1 ompweb        # 作为后台服务运行时很有用
 ```
 
 ## 功能特性
@@ -68,14 +94,16 @@ ompweb --no-open                           # 不自动打开浏览器
 
 ## 环境变量
 
-| 变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `PORT` | 服务端口 | `30177` |
-| `OMP_WEB_HOSTNAME` | 绑定主机名 | `127.0.0.1` |
-| `OMP_WEB_PASSWORD` | 可选的 Web 访问密码 | _无（未启用验证）_ |
-| `OMP_WEB_NO_OPEN` | 设为 `1` 时禁止自动打开浏览器 | `0` |
-| `OMP_WEB_OMP_BIN` | `omp` 二进制路径（未在 PATH 时使用） | _自动检测_ |
-| `PI_CODING_AGENT_DIR` | 自定义 omp agent 目录 | `~/.omp/agent` |
+| 变量 | 含义 |
+| --- | --- |
+| `PORT` | 服务器端口（默认 `30177`；`-p/--port` 优先） |
+| `OMP_WEB_HOSTNAME` | 绑定主机名（默认 `127.0.0.1`；`-H/--hostname` 优先） |
+| `OMP_WEB_PASSWORD` | 登录页面使用的可选密码 |
+| `OMP_WEB_NO_OPEN` | 设为 `1`/`true` 可跳过自动打开浏览器 |
+| `OMP_WEB_OMP_BIN` | `omp` 不在 `PATH` 中时，指向其二进制文件的绝对路径 |
+| `OMP_WEB_OMP_CONFIG` / `--omp-config` | 传给每个实时 OMP 子进程的配置文件 |
+| `PI_CODING_AGENT_DIR` | 指向其他 omp agent 目录（默认 `~/.omp/agent`） |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | 服务器端请求使用的标准代理变量 |
 
 ## 本地开发
 

@@ -104,11 +104,15 @@ export class RpcProcess {
     this.cwd = options.cwd;
     if (options.onFrame) this.frameListeners.add(options.onFrame);
 
-    const args = ["--mode", "rpc-ui", "--cwd", options.cwd, ...(options.extraArgs ?? [])];
+    const childEnvironment = sanitizeProjectCommandEnvironment({ ...process.env, ...options.env });
+    const configPath = typeof childEnvironment.OMP_WEB_OMP_CONFIG === "string"
+      ? childEnvironment.OMP_WEB_OMP_CONFIG.trim()
+      : "";
+    const configArgs = configPath ? ["--config", configPath] : [];
+    const args = ["--mode", "rpc-ui", "--cwd", options.cwd, ...configArgs, ...(options.extraArgs ?? [])];
     this.child = this.spawnProcess(bin, args, {
       cwd: options.cwd,
-      env: sanitizeProjectCommandEnvironment({ ...process.env, ...options.env }),
-      stdio: ["pipe", "pipe", "pipe"],
+      env: childEnvironment,
       windowsHide: true,
       // On POSIX, omp launches grandchildren (LSP servers, extension subprocesses). Run the
       // child in its own process group so dispose() can SIGTERM/SIGKILL the whole
