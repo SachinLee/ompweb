@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Frontend quality and test expectations"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "Type and boundary validation guidance"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Independent cross-layer verification checklist"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Check for duplicated lifecycle and payload logic"}
