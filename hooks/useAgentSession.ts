@@ -336,6 +336,9 @@ export interface UseAgentSessionOptions {
   onAgentEnd?: () => void;
   onSessionCreated?: (session: SessionInfo) => void;
   onSessionForked?: (newSessionId: string) => void;
+  /** Fires when a temporary-session retry recovered the runtime under a new
+   * omp id. Only transient rows (no JSONL on disk) can trigger it. */
+  onSessionIdChanged?: (previousId: string, newSessionId: string) => void;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   modelsRefreshKey?: number;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
@@ -739,6 +742,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventCoalescer = eventCoalescerRef.current;
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
+  const onSessionIdChanged = opts.onSessionIdChanged;
 
   const currentModel = currentModelOverride ?? data?.context.model ?? pendingModel ?? null;
   // For existing sessions, the live state's resolved model wins over the
@@ -2365,6 +2369,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // not a request to stop following the response that this prompt starts.
     userScrollIntentUntilRef.current = 0;
 
+    // Shared temporary-runtime ID migration: the server rebuilt a file-less
+    // runtime under a NEW omp id. Order matters — the fencing ref first (late
+    // SSE frames, roster merges and reconnect timers keyed to the old id must
+    // die), then the advisor identity (spawn registry + localStorage key),
+    // then the parent-selected row/URL. Callers keep their branch-local
+    // active id in sync after calling this.
+    const migrateToNewRuntimeId = (previousId: string, nextId: string) => {
+      if (!nextId || nextId === previousId) return;
+      sessionIdRef.current = nextId;
+      try {
+        const advisorStored = localStorage.getItem(`omp-advisor-enabled:${previousId}`) === "true";
+        if (advisorStored) localStorage.setItem(`omp-advisor-enabled:${nextId}`, "true");
+        else localStorage.removeItem(`omp-advisor-enabled:${nextId}`);
+        setSessionAdvisorSpawn(nextId, advisorStored);
+      } catch {
+        // In-memory spawn registry still applies for this page load.
+        setSessionAdvisorSpawn(nextId, false);
+      }
+      onSessionIdChanged?.(previousId, nextId);
+    };
+
     try {
       let sentSessionId: string | null = null;
       if (isNew && newSessionCwd) {
@@ -2377,34 +2402,76 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           // omp assigns the real id before the first prompt finishes. Promote
           // now so the sidebar can show this active session during streaming.
           promoteNewSession(1, message);
+          // The freshly ensured runtime can still die between the SSE connect
+          // and the prompt POST; the server recovers it under a NEW id from
+          // the transient marker, so the first-send flow carries the same
+          // migration callback as a temporary retry (reviewer m1).
+          let activeSessionId = sid;
+          const onSessionIdChange = (previousId: string, nextId: string) => {
+            migrateToNewRuntimeId(previousId, nextId);
+            activeSessionId = nextId;
+          };
           if (selectedModel) {
             setPendingModel(selectedModel);
             if (existingSid) {
-              await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
+              await sendAgentCommand(activeSessionId, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId }, { onSessionIdChange });
             }
           }
-          await ensureEventsConnected(sid);
-          void refreshSubagentRoster(sid);
-          await sendAgentCommand(sid, {
+          await ensureEventsConnected(activeSessionId);
+          void refreshSubagentRoster(activeSessionId);
+          await sendAgentCommand(activeSessionId, {
             type: "prompt",
             message,
             ...(piImages?.length ? { images: piImages } : {}),
-          });
+          }, { onSessionIdChange });
+          if (activeSessionId !== sid) {
+            // Reconnect onto the recovered runtime and restore the per-wrapper
+            // registrations that died with the old child (reviewer m2).
+            await ensureEventsConnected(activeSessionId);
+            void reconcileAgentState(activeSessionId);
+            reconnectActionsRef.current?.(activeSessionId);
+          }
+          sentSessionId = activeSessionId;
         }
       } else if (session) {
-        sentSessionId = session.id;
+        // A temporary session (omp has not written its JSONL yet, path === "")
+        // may have lost its omp child to an earlier first-prompt failure: the
+        // server rebuilds a runtime from the transient marker, possibly under
+        // a NEW omp id. Every POST in this flow therefore goes to the mutable
+        // activeSessionId and carries the same migration callback so the whole
+        // send stays on one lifecycle object. Saved sessions never migrate.
+        let activeSessionId = session.id;
+        const transientRetry = session.path === "" && !!session.cwd;
+        const onSessionIdChange = transientRetry
+          ? (previousId: string, nextId: string) => {
+              migrateToNewRuntimeId(previousId, nextId);
+              activeSessionId = nextId;
+            }
+          : undefined;
+
         // The event route is observer-only. Start or resume the web-owned RPC
         // wrapper with a supported command before opening the SSE connection.
-        await sendAgentCommand(session.id, { type: "get_state" });
-        await ensureEventsConnected(session.id);
-        void refreshSubagentRoster(session.id);
-        void registerHostTools(session.id);
-        void registerHostUriSchemes(session.id);
-        await sendAgentCommand(session.id, {
+        await sendAgentCommand(activeSessionId, { type: "get_state" }, { onSessionIdChange });
+        await ensureEventsConnected(activeSessionId);
+        void refreshSubagentRoster(activeSessionId);
+        void registerHostTools(activeSessionId);
+        void registerHostUriSchemes(activeSessionId);
+        await sendAgentCommand(activeSessionId, {
           type: "prompt",
           message,
           ...(piImages?.length ? { images: piImages } : {}),
-        });
+        }, { onSessionIdChange });
+        if (activeSessionId !== session.id) {
+          // The stream connected above belongs to the pre-recovery id:
+          // replace it with the recovered runtime's stream and reconcile the
+          // state once so the run's frames keep flowing under the new id.
+          await ensureEventsConnected(activeSessionId);
+          void reconcileAgentState(activeSessionId);
+          // Host tools, URI schemes and the roster were registered on the
+          // dead wrapper — restore them on the replacement (reviewer m2).
+          reconnectActionsRef.current?.(activeSessionId);
+        }
+        sentSessionId = activeSessionId;
       }
       if (isSlashCommandPrompt && sentSessionId) {
         void waitForPromptSettlement(sentSessionId, promptRunId);
@@ -2440,7 +2507,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       dispatch({ type: "end" });
       return false;
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, opts.chatInputRef, refreshSubagentRoster, registerHostTools, registerHostUriSchemes, clearTerminalReconcileTimer]);
+  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, opts.chatInputRef, onSessionIdChanged, refreshSubagentRoster, registerHostTools, registerHostUriSchemes, reconcileAgentState, clearTerminalReconcileTimer]);
 
   /** Abort the running agent and send the message as a fresh prompt
    * (abort_and_prompt). Only valid mid-run; the old turn's agent_end is

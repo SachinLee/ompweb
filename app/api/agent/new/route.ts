@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
-import { existsSync } from "fs";
+import { statSync } from "fs";
 import { randomUUID } from "crypto";
 import { allowFileRoot } from "@/lib/file-access";
 import { invalidateSessionListCache } from "@/lib/session-reader";
-import { WebRpcError, startRpcSession } from "@/lib/rpc-manager";
+import { WebRpcError, startRpcSession, updateTemporarySessionConfig, clearTemporarySession } from "@/lib/rpc-manager";
 import { RpcCommandError } from "@/lib/omp/rpc-process";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "@/lib/image-attachments";
@@ -39,7 +39,15 @@ export async function POST(req: Request) {
     if (!cwd || typeof cwd !== "string") {
       return NextResponse.json({ error: "cwd is required", code: "cwd_required" }, { status: 400 });
     }
-    if (!existsSync(cwd)) {
+    // An existing-but-not-directory path (a file) would fail later at spawn
+    // with a confusing error; validate it up front.
+    let cwdIsDirectory = false;
+    try {
+      cwdIsDirectory = statSync(cwd).isDirectory();
+    } catch {
+      cwdIsDirectory = false;
+    }
+    if (!cwdIsDirectory) {
       return NextResponse.json({ error: `Directory does not exist: ${cwd}`, code: "directory_not_found" }, { status: 400 });
     }
 
@@ -61,20 +69,32 @@ export async function POST(req: Request) {
     allowFileRoot(cwd);
     invalidateSessionListCache();
 
-    // Apply pre-selected model before sending the prompt
-    if (provider && modelId) {
-      await session.send({ type: "set_model", provider, modelId });
-    }
-
-    // Apply pre-selected thinking level before sending the prompt
-    if (thinkingLevel) {
-      await session.send({ type: "set_thinking_level", level: thinkingLevel });
+    // Apply pre-selected model/thinking before sending the prompt. A failure
+    // here leaves an anonymous half-configured wrapper the browser cannot
+    // reference by any session id — destroy it and drop the transient marker.
+    try {
+      if (provider && modelId) {
+        await session.send({ type: "set_model", provider, modelId });
+        updateTemporarySessionConfig(realSessionId, { requestedModel: { provider, modelId } });
+      }
+      if (thinkingLevel) {
+        await session.send({ type: "set_thinking_level", level: thinkingLevel });
+        updateTemporarySessionConfig(realSessionId, { thinkingLevel });
+      }
+    } catch (error) {
+      await session.destroyAndWait();
+      clearTemporarySession(realSessionId);
+      throw error;
     }
 
     if (promptCommand.type === "ensure_session") {
       return NextResponse.json({ success: true, sessionId: realSessionId, data: null });
     }
 
+    // Prompt phase: an RPC/network failure here (e.g. the omp child exits with
+    // Windows 10053) keeps the transient marker so the user can retry the same
+    // message through /api/agent/[id], which recovers the runtime from it. The
+    // prompt is never resent automatically.
     const result = await session.send(promptCommand);
 
     return NextResponse.json({ success: true, sessionId: realSessionId, data: result });

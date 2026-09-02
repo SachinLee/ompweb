@@ -798,6 +798,7 @@
   "sessionSidebar.delete": "Delete",
   "sessionSidebar.deleteConfirm": "Delete “{title}”?",
   "sessionSidebar.deleteFailed": "Failed to delete the session",
+  "sessionSidebar.deleting": "Deleting…",
   "sessionSidebar.archiveFailed": "Failed to archive the session",
   "sessionSidebar.expandForks": "Expand forks",
   "sessionSidebar.explorer": "Explorer",

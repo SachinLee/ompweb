@@ -817,6 +817,22 @@ export function AppShell() {
     setInitialSessionRestored(true);
   }, []);
 
+  const handleSessionIdChanged = useCallback((previousId: string, newSessionId: string) => {
+    // Follow a server-side temporary-session recovery onto its new runtime id
+    // — but ONLY while the still-selected row is the transient one (no JSONL
+    // on disk yet) carrying the old id. This stays the same user-visible
+    // session: no remount/sessionKey reset, messages and input are preserved.
+    // The ref check (not the render-time closure) guards a mid-recovery row
+    // switch: an async callback captured by an older send must not rewrite
+    // another view's URL (reviewer m4).
+    if (activeSessionIdRef.current !== previousId) return;
+    if (!selectedSession || selectedSession.path !== "" || selectedSession.id !== previousId) return;
+    setSelectedSession((prev) => prev && prev.path === "" && prev.id === previousId
+      ? { ...prev, id: newSessionId }
+      : prev);
+    router.replace(`?session=${encodeURIComponent(newSessionId)}`, { scroll: false });
+  }, [selectedSession, router]);
+
   const handleSessionDeleted = useCallback((sessionId: string) => {
     setRefreshKey((k) => k + 1);
     if (selectedSession?.id === sessionId) {
@@ -1661,6 +1677,7 @@ export function AppShell() {
               onAgentEnd={handleAgentEnd}
               onSessionCreated={handleSessionCreated}
               onSessionForked={handleSessionForked}
+              onSessionIdChanged={handleSessionIdChanged}
               modelsRefreshKey={modelsRefreshKey}
               chatInputRef={chatInputRef}
               onOpenFile={handleOpenLinkedFile}

@@ -329,7 +329,12 @@ export class AgentSessionWrapper {
     this.streaming = state.isStreaming;
     this.compacting = state.isCompacting;
     this.fastModeEnabled = state.fastModeEnabled ?? state.fastMode ?? this.fastModeEnabled;
-    if (this._sessionFile) cacheSessionPath(this._sessionId, this._sessionFile);
+    if (this._sessionFile) {
+      cacheSessionPath(this._sessionId, this._sessionFile);
+      // The session file now exists on disk: the transient recovery marker's
+      // job is done (the file is the authoritative identity from here on).
+      if (existsSync(this._sessionFile)) clearTemporarySession(this._sessionId);
+    }
   }
 
   handleProcessExit(stderrTail: string): void {
@@ -779,6 +784,9 @@ export class AgentSessionWrapper {
     if (state.sessionId) {
       this._sessionId = state.sessionId;
       this._sessionFile = state.sessionFile ?? this._sessionFile;
+      // Same rule as applyIdentity: a confirmed session file ends the
+      // transient recovery marker's lifetime.
+      if (this._sessionFile && existsSync(this._sessionFile)) clearTemporarySession(this._sessionId);
     }
 
     const awaitingExpired = !this.awaitingAgentStart || Date.now() >= this.awaitingAgentStartDeadline;
@@ -1394,6 +1402,13 @@ export async function startRpcSession(
     }
 
     const realSessionId = created.sessionId;
+    // A brand-new runtime whose JSONL omp has not written yet gets a transient
+    // recovery marker (cwd/toolset/advisor) so a crashed child can be
+    // re-spawned for the same session. A runtime that already reports a session
+    // file takes saved semantics — no marker.
+    if (sessionFile === "" && created.sessionFile === "") {
+      rememberTemporarySession({ sessionId: realSessionId, cwd, toolNames, advisor: advisor === true });
+    }
     created.onDestroy(() => {
       if (registry.get(created.sessionId) === created) registry.delete(created.sessionId);
       if (registry.get(realSessionId) === created) registry.delete(realSessionId);
@@ -1408,4 +1423,214 @@ export async function startRpcSession(
 
   locks.set(sessionId, starting);
   return starting;
+}
+
+// ----------------------------------------------------------------------------
+// Temporary session metadata (memory-only recovery support)
+//
+// A brand-new runtime may die (RPC/network error, Windows 10053) before omp
+// writes its session file. Once the file exists it is the authoritative
+// identity, but until then only this in-memory metadata lets a retry rebuild a
+// usable runtime for the same session. State lives on globalThis (same pattern
+// as __ompSessions) so it survives Next.js hot reload, is bounded by TTL + an
+// entry cap, and never becomes a substitute for the on-disk session file.
+// ----------------------------------------------------------------------------
+
+export interface TemporarySessionMarker {
+  /** Workspace the transient runtime was spawned in. Re-validated as a real
+   * directory before any recovery spawn (empty string = never registered). */
+  cwd: string;
+  /** Spawn-time builtin toolset of the new session (buildSessionSpawnArgs). */
+  toolNames?: string[];
+  /** Spawn-time --advisor flag. */
+  advisor?: boolean;
+  /** Model/thinking presets confirmed after spawn (set_model RPC). Restored on
+   * a replacement runtime before the retrying command is sent. */
+  requestedModel?: { provider: string; modelId: string };
+  thinkingLevel?: string;
+  expiresAt: number;
+}
+
+interface SessionAliasEntry {
+  target: string;
+  expiresAt: number;
+}
+
+/** Transient markers live as long as an idle runtime would (10 min) — after
+ * that a file-less session is treated as gone, matching the registry's idle
+ * destroy cap. */
+export const TEMPORARY_SESSION_TTL_MS = IDLE_DESTROY_MS;
+/** Hard cap so a misbehaving client cannot grow the tables without bound. */
+export const TEMPORARY_SESSION_MAX_ENTRIES = 256;
+/** Alias chains only ever point old → newer ids; the hop cap is a cycle guard. */
+const MAX_ALIAS_HOPS = 8;
+
+declare global {
+  var __ompTemporarySessions: Map<string, TemporarySessionMarker> | undefined;
+  var __ompTemporaryAliases: Map<string, SessionAliasEntry> | undefined;
+  var __ompLifecycleLocks: Map<string, Promise<unknown>> | undefined;
+}
+
+function getTemporaryMarkers(): Map<string, TemporarySessionMarker> {
+  if (!globalThis.__ompTemporarySessions) globalThis.__ompTemporarySessions = new Map();
+  return globalThis.__ompTemporarySessions;
+}
+
+function getTemporaryAliases(): Map<string, SessionAliasEntry> {
+  if (!globalThis.__ompTemporaryAliases) globalThis.__ompTemporaryAliases = new Map();
+  return globalThis.__ompTemporaryAliases;
+}
+
+function getLifecycleLocks(): Map<string, Promise<unknown>> {
+  if (!globalThis.__ompLifecycleLocks) globalThis.__ompLifecycleLocks = new Map();
+  return globalThis.__ompLifecycleLocks;
+}
+
+/** Keep a table bounded: before inserting a NEW key, drop the oldest entries
+ * (Map preserves insertion order) until there is room. */
+function evictOldestForCap<T>(table: Map<string, T>, pendingKey?: string): void {
+  while (table.size >= TEMPORARY_SESSION_MAX_ENTRIES && !table.has(pendingKey ?? "")) {
+    const oldest = table.keys().next().value;
+    if (oldest === undefined) break;
+    table.delete(oldest);
+  }
+}
+
+/** Remember (create or merge) the whitelisted startup/config of a transient
+ * file-less session so a later request can rebuild a runtime for it. Merging
+ * must not drop fields recorded by the other caller (startRpcSession records
+ * cwd/toolNames/advisor; the agent/new route adds confirmed model config). */
+export function rememberTemporarySession(
+  entry: {
+    sessionId: string;
+    cwd?: string;
+    toolNames?: string[];
+    advisor?: boolean;
+    requestedModel?: { provider: string; modelId: string };
+    thinkingLevel?: string;
+  },
+  options?: { ttlMs?: number },
+): void {
+  if (!entry?.sessionId) return;
+  const markers = getTemporaryMarkers();
+  const existing = markers.get(entry.sessionId);
+  const merged: TemporarySessionMarker = {
+    cwd: entry.cwd ?? existing?.cwd ?? "",
+    ...(entry.toolNames !== undefined ? { toolNames: entry.toolNames } : {}),
+    ...(entry.advisor !== undefined ? { advisor: entry.advisor } : {}),
+    ...(entry.requestedModel !== undefined ? { requestedModel: entry.requestedModel } : {}),
+    ...(entry.thinkingLevel !== undefined ? { thinkingLevel: entry.thinkingLevel } : {}),
+    expiresAt: Date.now() + (options?.ttlMs ?? TEMPORARY_SESSION_TTL_MS),
+  };
+  if (!existing) evictOldestForCap(markers, entry.sessionId);
+  markers.set(entry.sessionId, merged);
+}
+
+/** Merge-only update for an existing marker (e.g. model config confirmed by
+ * /api/agent/new after set_model succeeds). Never creates a marker — only
+ * startRpcSession registers file-less runtimes. */
+export function updateTemporarySessionConfig(
+  sessionId: string,
+  config: { requestedModel?: { provider: string; modelId: string }; thinkingLevel?: string },
+): void {
+  const markers = getTemporaryMarkers();
+  const marker = markers.get(sessionId);
+  if (!marker) return;
+  if (Date.now() >= marker.expiresAt) {
+    markers.delete(sessionId);
+    return;
+  }
+  if (config.requestedModel !== undefined) marker.requestedModel = config.requestedModel;
+  if (config.thinkingLevel !== undefined) marker.thinkingLevel = config.thinkingLevel;
+}
+
+/** Look up an unexpired transient marker (lazy TTL cleanup). */
+export function getTemporarySession(sessionId: string): TemporarySessionMarker | undefined {
+  const markers = getTemporaryMarkers();
+  const marker = markers.get(sessionId);
+  if (!marker) return undefined;
+  if (Date.now() >= marker.expiresAt) {
+    markers.delete(sessionId);
+    return undefined;
+  }
+  return marker;
+}
+
+/** Resolve an id through the (bounded) alias chain to its canonical runtime
+ * id. Unknown/expired aliases resolve to the input unchanged. */
+export function resolveCanonicalSessionId(sessionId: string): string {
+  const aliases = getTemporaryAliases();
+  let current = sessionId;
+  for (let hops = 0; hops < MAX_ALIAS_HOPS; hops++) {
+    const alias = aliases.get(current);
+    if (!alias) break;
+    if (Date.now() >= alias.expiresAt) {
+      aliases.delete(current);
+      break;
+    }
+    current = alias.target;
+  }
+  return current;
+}
+
+/** Re-anchor the marker for a recovered session under its new runtime id and
+ * alias the old id to it, so late requests for the old id canonicalize onto
+ * the same lifecycle object. */
+export function migrateTemporarySessionId(oldId: string, newId: string, options?: { ttlMs?: number }): void {
+  if (!oldId || !newId || oldId === newId) return;
+  const markers = getTemporaryMarkers();
+  const aliases = getTemporaryAliases();
+  const expiresAt = Date.now() + (options?.ttlMs ?? TEMPORARY_SESSION_TTL_MS);
+  const marker = markers.get(oldId);
+  if (marker && Date.now() < marker.expiresAt) {
+    evictOldestForCap(markers, newId);
+    markers.set(newId, { ...marker, expiresAt });
+  }
+  markers.delete(oldId);
+  evictOldestForCap(aliases, oldId);
+  aliases.set(oldId, { target: newId, expiresAt });
+}
+
+/** Drop the transient marker for a session plus every alias of the same
+ * lifecycle. Called when the JSONL file is confirmed on disk and by explicit
+ * teardown. */
+export function clearTemporarySession(sessionId: string): void {
+  if (!sessionId) return;
+  const markers = getTemporaryMarkers();
+  const aliases = getTemporaryAliases();
+  const canonical = resolveCanonicalSessionId(sessionId);
+  markers.delete(canonical);
+  markers.delete(sessionId);
+  aliases.delete(sessionId);
+  for (const [aliasId, alias] of [...aliases]) {
+    if (alias.target === canonical) aliases.delete(aliasId);
+  }
+}
+
+/** Serialize lifecycle operations (recovery, delete, late requests) per
+ * canonical session id so a DELETE can never race a recovery into a second
+ * runtime. A failed prior holder does not poison the queue. */
+function enqueueLifecycleOperation<T>(sessionId: string, key: string, operation: () => Promise<T>): Promise<T> {
+  const locks = getLifecycleLocks();
+  const prior = locks.get(key);
+  const result = (prior ?? Promise.resolve()).then(async () => {
+    // A prior holder may have migrated the id (recovery re-keys the runtime):
+    // re-resolve before running so a queued delete/late request lands on the
+    // canonical chain instead of running in parallel with it.
+    const canonicalNow = resolveCanonicalSessionId(sessionId);
+    if (canonicalNow !== key) {
+      return enqueueLifecycleOperation(sessionId, canonicalNow, operation);
+    }
+    return operation();
+  });
+  const settled = result.catch(() => {});
+  locks.set(key, settled);
+  void settled.then(() => {
+    if (locks.get(key) === settled) locks.delete(key);
+  });
+  return result;
+}
+
+export function withSessionLifecycleLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+  return enqueueLifecycleOperation(sessionId, resolveCanonicalSessionId(sessionId), operation);
 }

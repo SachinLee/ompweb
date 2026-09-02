@@ -23,7 +23,7 @@ import {
 } from "@/lib/session-reader";
 import { apiErrorResponse, resolveSessionPathOr404 } from "@/lib/api-utils";
 import { sessionPathKey } from "@/lib/paths";
-import { getRpcSession } from "@/lib/rpc-manager";
+import { clearTemporarySession, getRpcSession, getTemporarySession, resolveCanonicalSessionId, withSessionLifecycleLock } from "@/lib/rpc-manager";
 
 // BranchNavigator still traverses recursively, so keep the response tree shallow.
 const MAX_PROJECTED_TREE_DEPTH = 200;
@@ -271,19 +271,12 @@ export async function PATCH(
 }
 
 // DELETE /api/sessions/[id]
-export async function DELETE(
-  _req: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id } = await params;
-  try {
-    const resolved = await resolveSessionPathOr404(id);
-    if ("response" in resolved) return resolved.response;
-    const filePath = resolved.filePath;
-
+/** Saved-session deletion: child re-parent scan, destroy-before-unlink,
+ * artifact + cache cleanup. Runs inside the session lifecycle lock. */
+async function deleteSavedSession(filePath: string, canonicalId: string): Promise<NextResponse> {
     // Read only the bounded header before deleting.
     const deletedHeader = readSessionHeader(filePath);
-    const deletedSessionId = deletedHeader?.id ?? id;
+    const deletedSessionId = deletedHeader?.id ?? canonicalId;
     const parentSession = deletedHeader?.parentSession;
 
     // Children reference their parent either by file path or by bare session id
@@ -390,15 +383,67 @@ export async function DELETE(
       }
     } catch { /* skip if dir unreadable */ }
 
-    // Await the child's exit before unlinking: omp flushes session state on
-    // shutdown and would recreate the file if it were still running.
-    await getRpcSession(id)?.destroyAndWait?.();
-    deleteSessionFileWithArtifacts(filePath);
-    invalidateSessionPathCache(id);
-    invalidateSessionListCache();
-    return NextResponse.json({
-      ok: true,
-      ...(skippedChildren.length > 0 ? { skippedChildren } : {}),
+  await getRpcSession(canonicalId)?.destroyAndWait?.();
+  // A transient marker can coexist with an on-disk file in the recovery
+  // window (migration re-anchors it before the next state read clears it).
+  // Left behind, a late command would respawn a successor runtime for a
+  // deleted session — clear it so saved and temporary deletes end in the
+  // same no-metadata state.
+  clearTemporarySession(canonicalId);
+  deleteSessionFileWithArtifacts(filePath);
+  invalidateSessionPathCache(canonicalId);
+  invalidateSessionListCache();
+  return NextResponse.json({
+    ok: true,
+    ...(skippedChildren.length > 0 ? { skippedChildren } : {}),
+  });
+}
+
+export async function DELETE(
+  _req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+  try {
+    // Serialize the whole delete against recovery/late requests sharing this
+    // canonical session: only one terminal cleanup can ever run, and no
+    // waiting recovery may spawn a replacement after the delete completed.
+    // The lock is keyed on the raw request id and the canonical id is
+    // resolved at execution time: a prior holder (an in-flight recovery)
+    // may migrate the id while this delete waits, so the re-queued body
+    // must probe the migrated runtime — a request-time-only resolution
+    // would hit stale registry/marker misses and report alreadyDeleted
+    // while the recovered wrapper is alive.
+    return await withSessionLifecycleLock(id, async () => {
+      const canonicalId = resolveCanonicalSessionId(id);
+      // No immediate 404: a temporary session (marker/wrapper, no file yet)
+      // deletes differently from a saved one.
+      const filePath = await resolveSessionPath(canonicalId);
+
+      if (!filePath) {
+        const live = getRpcSession(canonicalId);
+        const marker = getTemporarySession(canonicalId);
+        if (!live && !marker) {
+          // Idempotent no-op: no file, no runtime, no transient metadata.
+          // The path cache may still hold a stale entry for this id.
+          invalidateSessionPathCache(canonicalId);
+          return NextResponse.json({ ok: true, alreadyDeleted: true });
+        }
+        // Clearing the marker FIRST is the deleting flag: a queued recovery
+        // re-checks it under this same lock and will not spawn afterwards.
+        clearTemporarySession(canonicalId);
+        // Join an in-flight destroy too (wrapper already exiting).
+        if (live?.isAlive?.() || live?.destroyPromise) await live.destroyAndWait();
+        // The child's shutdown flush may have produced the file after all —
+        // then the same saved cleanup (re-parent + artifact deletion) applies.
+        const flushedPath = await resolveSessionPath(canonicalId);
+        if (flushedPath) return deleteSavedSession(flushedPath, canonicalId);
+        invalidateSessionListCache();
+        invalidateSessionPathCache(canonicalId);
+        return NextResponse.json({ ok: true, temporary: true });
+      }
+
+      return deleteSavedSession(filePath, canonicalId);
     });
   } catch (error) {
     return apiErrorResponse(error);

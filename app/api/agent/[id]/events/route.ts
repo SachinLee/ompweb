@@ -1,4 +1,4 @@
-import { getRpcSession } from "@/lib/rpc-manager";
+import { getRpcSession, resolveCanonicalSessionId } from "@/lib/rpc-manager";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +12,9 @@ export async function GET(
   // SSE is observer-only: listing or opening a saved session must not create
   // another omp process for a terminal-owned session. Explicit commands use
   // POST /api/agent/[id], which starts the wrapper before this route attaches.
-  const existing = getRpcSession(id);
+  // Late connects carrying a pre-recovery id follow the alias chain to the
+  // recovered runtime instead of a spurious 409 (reviewer m3).
+  const existing = getRpcSession(resolveCanonicalSessionId(id));
   const session = existing?.isAlive() ? existing : undefined;
   if (!session) return new Response("Session is not managed by omp-web", { status: 409 });
 

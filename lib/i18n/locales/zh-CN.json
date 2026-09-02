@@ -798,6 +798,7 @@
   "sessionSidebar.delete": "删除",
   "sessionSidebar.deleteConfirm": "删除“{title}”？",
   "sessionSidebar.deleteFailed": "删除会话失败",
+  "sessionSidebar.deleting": "删除中…",
   "sessionSidebar.archiveFailed": "归档会话失败",
   "sessionSidebar.expandForks": "展开分叉",
   "sessionSidebar.explorer": "资源管理器",

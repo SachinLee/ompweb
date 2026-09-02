@@ -35,6 +35,8 @@ interface Props {
   onAgentEnd?: () => void;
   onSessionCreated?: (session: SessionInfo) => void;
   onSessionForked?: (newSessionId: string) => void;
+  /** Follows a temporary-session retry onto its recovered runtime id. */
+  onSessionIdChanged?: (previousId: string, newSessionId: string) => void;
   modelsRefreshKey?: number;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
@@ -417,7 +419,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed = true, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onContextUsageChange, onModelCapacityChange, onGenerationSpeedChange, onOpenFile }: Props) {
+export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed = true, onAgentEnd, onSessionCreated, onSessionForked, onSessionIdChanged, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onContextUsageChange, onModelCapacityChange, onGenerationSpeedChange, onOpenFile }: Props) {
   const { t, tn } = useI18n();
   const { playDoneSound, unlockAudio } = useAudio();
   const isMobile = useIsMobile();
@@ -458,7 +460,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
     handleBuiltinSlashCommand, togglePreCompactionHistory,
     handleThinkingLevelChange, handleFastModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, loadSlashCommands,
   } = useAgentSession({
-    session, newSessionCwd, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked,
+    session, newSessionCwd, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionIdChanged,
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
     onOpenFile,
   });
@@ -892,9 +894,9 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
       cwd={session?.cwd ?? newSessionCwd}
     />
   );
-
   const aboveEditorWidgets = extensionWidgets.filter((widget) => widget.placement !== "belowEditor");
   const belowEditorWidgets = extensionWidgets.filter((widget) => widget.placement === "belowEditor");
+
 
   if (loading) {
     return (
@@ -1184,6 +1186,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
               onSelectSubagent={setSelectedSubagent}
             />
             <ExtensionWidgets widgets={belowEditorWidgets} />
+
           </div>
         </div>
         {chatInputElement}
@@ -1249,6 +1252,7 @@ function ExtensionWidgets({ widgets }: { widgets: Array<{ key: string; lines: st
     </div>
   );
 }
+
 
 function NoticeShelf({ notices, floating = false, align = "left" }: { notices: NoticeItem[]; floating?: boolean; align?: "left" | "right" }) {
   if (notices.length === 0) return null;

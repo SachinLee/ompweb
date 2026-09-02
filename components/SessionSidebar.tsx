@@ -1354,15 +1354,15 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
     onSelectSession(s);
   }, [onSelectSession, expandProject]);
 
-  const handleNewSession = useCallback(() => {
-    if (!selectedCwd) return;
+  const handleNewSession = useCallback((cwd: string) => {
     // Generate a temporary UUID client-side — no backend call needed.
     // Pi will be spawned lazily when the user sends the first message.
     const tempId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-    onNewSession?.(tempId, selectedCwd);
-  }, [selectedCwd, onNewSession]);
+    onNewSession?.(tempId, cwd);
+  }, [onNewSession]);
+
 
   const [importing, setImporting] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -1547,43 +1547,6 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
             void handleImportSession(file);
           }}
         />
-        <button
-          onClick={handleNewSession}
-          disabled={!selectedCwd}
-          className="sidebar-new-session"
-          title={selectedCwd ? t("sessionSidebar.newSessionIn", { cwd: selectedCwd }) : t("sessionSidebar.selectProjectFirst")}
-          style={{
-            width: "100%",
-            height: 38,
-            boxSizing: "border-box",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 7,
-            background: "var(--bg-hover)",
-            border: "1px solid var(--border)",
-            borderRadius: 9,
-            color: selectedCwd ? "var(--text)" : "var(--text-dim)",
-            cursor: selectedCwd ? "pointer" : "not-allowed",
-            fontSize: 12.5,
-            fontWeight: 600,
-            letterSpacing: "-0.01em",
-            opacity: selectedCwd ? 1 : 0.65,
-            transition: SIDEBAR_BUTTON_TRANSITION,
-          }}
-          onMouseEnter={(e) => {
-            if (!selectedCwd) return;
-            e.currentTarget.style.background = "var(--bg-selected)";
-            e.currentTarget.style.borderColor = "color-mix(in srgb, var(--accent) 30%, transparent)";
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = "var(--bg-hover)";
-            e.currentTarget.style.borderColor = "var(--border)";
-          }}
-        >
-          <Plus size={15} strokeWidth={2.2} style={{ color: "var(--accent)", flexShrink: 0 }} aria-hidden="true" />
-          <span>{t("sessionSidebar.new")}</span>
-        </button>
       </div>
 
       {/* Workspaces section header: label + search / filter / add */}
@@ -1733,6 +1696,8 @@ export function SessionSidebar({ selectedSessionId, optimisticSession, onSelectS
                 isDragTarget={draggedProjectPath !== null && draggedProjectPath !== project.path}
                 removeBusy={removeProjectPath === project.path}
                 onSelectSession={handleSelectSessionFromList}
+                onNewSession={handleNewSession}
+
                 onRenamed={loadSessions}
                 onSessionDeleted={handleSessionDeleted}
                 activeWorktreeSwitcher={isActive ? activeProjectSwitcher : null}
@@ -1974,6 +1939,8 @@ interface ProjectRowProps {
   isDragTarget: boolean;
   removeBusy: boolean;
   onSelectSession: (s: SessionInfo) => void;
+  onNewSession: (cwd: string) => void;
+
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
   activeWorktreeSwitcher?: ReactNode;
@@ -2010,6 +1977,8 @@ function ProjectRow({
   isDragTarget,
   removeBusy,
   onSelectSession,
+  onNewSession,
+
   onRenamed,
   onSessionDeleted,
   activeWorktreeSwitcher,
@@ -2171,6 +2140,12 @@ function ProjectRow({
             </span>
           </button>
         )}
+        <SidebarIconButton
+          label={t("sessionSidebar.newSessionIn", { cwd: project.path })}
+          onClick={() => onNewSession(project.path)}
+        >
+          <Plus size={14} strokeWidth={2} aria-hidden="true" />
+        </SidebarIconButton>
         {worktreeBranch && worktreeToggleRef && (
           <button
             type="button"
@@ -2857,30 +2832,46 @@ const SessionItem = memo(function SessionItem({
   }, [renameValue, session.id, session.name, onRenamed]);
 
  const handleArchive = useCallback(async () => {
+ if (deleting) return; // shared row lock: one in-flight action per row
  setConfirmArchive(false);
  setDeleting(true);
  try {
  const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/archive`, { method: "POST" });
- if (!response.ok) throw new Error("Session archive failed");
- onDeleted?.(session.id);
- } catch {
- setDeleting(false);
- toast.error(t("sessionSidebar.archiveFailed"));
+ if (!response.ok) {
+ const data = await response.json().catch(() => null);
+ // Surface the server's actual error; formatApiError localizes known codes
+ // and falls back to the server text for unknown ones.
+ throw new Error(formatApiError(data ?? `HTTP ${response.status}`));
  }
- }, [session.id, onDeleted, t]);
+ onDeleted?.(session.id);
+ } catch (e) {
+ setDeleting(false);
+ toast.error(e instanceof Error && e.message ? e.message : t("sessionSidebar.archiveFailed"));
+ }
+ }, [deleting, session.id, onDeleted, t]);
 
   const handleDelete = useCallback(async () => {
+    if (deleting) return; // shared row lock: one in-flight action per row
     setConfirmDelete(false);
     setDeleting(true);
     try {
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
-      if (!response.ok) throw new Error("Session deletion failed");
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        // Surface the server's actual error; formatApiError localizes known
+        // codes and falls back to the server text for unknown ones.
+        throw new Error(formatApiError(data ?? `HTTP ${response.status}`));
+      }
+      // Success: the parent removes the row — never restore it here.
       onDeleted?.(session.id);
-    } catch {
+    } catch (e) {
       setDeleting(false);
-      toast.error(t("sessionSidebar.deleteFailed"));
+      // A thrown formatted error carries the real message; only a
+      // network-level failure (fetch rejected before a response) shows the
+      // localized generic toast.
+      toast.error(e instanceof Error && e.message ? e.message : t("sessionSidebar.deleteFailed"));
     }
-  }, [session.id, onDeleted, t]);
+  }, [deleting, session.id, onDeleted, t]);
 
  const closeConfirmation = useCallback(() => {
  setConfirmArchive(false);
@@ -2942,8 +2933,8 @@ const SessionItem = memo(function SessionItem({
               ? t("sessionSidebar.archiveConfirm", { title: title.length > 22 ? `${title.slice(0, 22)}…` : title })
               : t("sessionSidebar.deleteConfirm", { title: title.length > 22 ? `${title.slice(0, 22)}…` : title })}
           </span>
-          <button onClick={(event) => { event.stopPropagation(); if (confirmArchive) void handleArchive(); else void handleDelete(); }} style={{ height: 28, padding: "0 10px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
-            {confirmArchive ? t("sessionSidebar.archive") : t("sessionSidebar.delete")}
+          <button onClick={(event) => { event.stopPropagation(); if (confirmArchive) void handleArchive(); else void handleDelete(); }} disabled={deleting} aria-busy={deleting} style={{ height: 28, padding: "0 10px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: deleting ? "wait" : "pointer", fontSize: 11, fontWeight: 600, opacity: deleting ? 0.7 : 1 }}>
+            {deleting ? t("sessionSidebar.deleting") : confirmArchive ? t("sessionSidebar.archive") : t("sessionSidebar.delete")}
           </button>
           <button onClick={(event) => { event.stopPropagation(); closeConfirmation(); }} autoFocus style={{ height: 28, padding: "0 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text-muted)", cursor: "pointer", fontSize: 11 }}>
             {t("sessionSidebar.cancel")}
